@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scada-grid-frequency-drift-clamp"
+version = "1.0.0"
+description = "SCADA Grid Frequency Drift Clamp"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "TechieGoku2623"}]
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "black==24.8.0",
+    "flake8==7.1.1",
+]
+
+[project.scripts]
+scada-grid-frequency-drift-clamp = "scada_grid_frequency_drift_clamp.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 88
+target-version = ["py312"]

@@ -1,103 +1,137 @@
 # SCADA Grid Frequency Drift Clamp
 
-A high-throughput, low-latency asynchronous engine engineered to resolve unbounded publication of grid frequency by clamping the published value to a physical band around the 60 Hz nominal and by holding the last setpoint when the rate of change of frequency is impossible.
+A high-throughput, low-latency asynchronous engine engineered to resolve out-of-band grid frequency samples by smoothing a nominal 60 Hz series in process and publishing a deadband- and RoCoF-limited setpoint.
 
 ## 🏗️ Systems Architecture & Event Topology
 
-`FrequencyDriftClamp` ingests one scalar at a time through `ingest_sample`. The nominal is 60 Hz. The cadence recorded in the measurement frame is 100 ms. The published series is a bounded `deque` standing in for TimescaleDB. `published_series` returns that series. `describe_frame` decodes the packed measurement and the clamped setpoint.
+`ScadaGridFrequencyDriftClamp` ingests a frequency series under an `asyncio.Lock`. Nominal frequency is 60.0 Hz and the sample period is 0.1 s (100 ms). `run(records)` returns a JSON-serializable dict: `published_hz`, `rocof_hz_s`, `clamps`, and `rejected`.
 
-The frame layout is internal. It is not a field protocol, and the engine never emits a control write. An `asyncio.Lock` covers the series, the setpoint, and the frame deque. `logging.basicConfig` timestamps every line. A non-finite sample and an impossible step raise `EngineKernelException` (the NaN path rejects; the impossible RoCoF path holds the setpoint and records the fault). `run_scenario` is what `python src/main.py` awaits.
+The smoother is exponential:
 
-NERC CIP monitoring alignment here means: measure, clamp what is published, and keep the control output absent. This process does not speak DNP3, Modbus, or IEC 61850, and it does not write a setpoint to a relay.
+```
+f_hat = f_hat + alpha * (f - f_hat)
+RoCoF = (f_hat - previous_f_hat) / dt
+```
+
+`alpha` defaults to 0.30. If `abs(f - 60)` exceeds the deadband (0.05 Hz) or `abs(RoCoF)` exceeds 1.0 Hz/s, the engine publishes the clamped setpoint: nominal plus the deadband in the direction of the error, then limited so the published value cannot move faster than `rocof_limit * dt` from the previous published value. A warning is logged. The published series is a bounded `deque` (default 4096) standing in for TimescaleDB.
+
+An implied raw RoCoF above the hard ceiling (5.0 Hz/s) is clamped and counted. The smoother does not follow that sample. NaN and any non-finite sample raise `EngineKernelException` before the series changes.
+
+The measurement record is `struct` format `<HHHiii`: sync `0x4652`, flags, cadence in milliseconds, measured millihertz, RoCoF in millihertz per second, and published millihertz. A length prefix seals the frame. The engine never emits a control write and never opens a field protocol.
 
 ## 📊 Core Visual Walkthrough & Engine Pipeline Flow
 
 ```
-frequency sample (Hz) at 100 ms cadence
-    |
-    v
-finite gate ---- NaN / inf --> EngineKernelException, series unchanged
-    |
-    v
-RoCoF = (sample - previous) / cadence
-    |
-    +-- |RoCoF| within the physical bound --> publish clamped value, WARNING if moved
-    |
-    +-- |RoCoF| above the bound ------------> hold setpoint, fault=impossible_rocof
-                                               control_write remains false
-    v
-bounded deque + packed frame
+frequency sample (Hz), dt = 0.1 s
+        |
+        v
+finite gate ---- NaN or inf --> EngineKernelException
+        |
+        v
+implied RoCoF versus last admitted sample
+        |
+        +--> abs(implied) > 5 Hz/s
+        |       clamp, count clamps and rejected
+        |       do not update f_hat
+        |
+        v
+f_hat = f_hat + alpha * (f - f_hat)
+RoCoF = (f_hat - previous) / dt
+        |
+        +--> outside deadband or |RoCoF| > 1 Hz/s
+        |       publish nominal ± deadband
+        |       limit the step to rocof_limit * dt
+        |
+        +--> inside the band --> publish f
+        |
+        v
+bounded deque (TimescaleDB stand-in) + measurement frame
+        |
+        v
+{published_hz, rocof_hz_s, clamps, rejected}
 ```
 
 Insert the structural terminal walkthrough recording at docs/assets/terminal-walkthrough.gif before publishing the release notes.
 
 ## ⚡ Low-Level OS Mechanics & Network Physics
 
-RoCoF is a first difference divided by the fixed cadence. With a 100 ms frame, a 0.2 Hz move is 2 Hz/s. The physical bound in the scenario is 5 Hz/s. A step that implies 48 Hz/s is treated as a transducer or clock fault, not as a grid event the publisher should repeat. `math.isfinite` is the first gate so a NaN cannot become a RoCoF of NaN and slip through the comparison.
+The sample period is the model `dt`, not a sleep. A batch of samples is scored as if they arrived 100 ms apart, which keeps the benchmark on the arithmetic path.
 
-The published value is clamped toward the nominal before it is appended. The raw sample is not what `published_series` returns after a clamp. `statistics` summarizes the held window for the scenario report. The frame is `struct`-packed to a fixed 18-byte width asserted in `__init__`. No serial port and no TCP session is opened.
+The deadband edges sit at 59.95 Hz and 60.05 Hz. A sample of 60.2 Hz is admitted to the smoother, because the implied step from a nearby in-band sample is under the 5 Hz/s ceiling, and the published setpoint is pulled back to 60.05 Hz when the previous setpoint is within one RoCoF step (`1.0 Hz/s * 0.1 s = 0.1 Hz`).
+
+A step such as 60.2 Hz then 65.0 Hz implies about 48 Hz/s. That is above the hard ceiling. The engine publishes 60.05 Hz, increments `clamps` and `rejected`, stores the implied rate in `rocof_hz_s`, and leaves `f_hat` and the last admitted sample unchanged. The next in-band 60.0 Hz sample is therefore still admissible.
+
+`statistics.fmean` and `statistics.pstdev` run on a 64-sample window so the warning carries the recent mean and spread. `math.floor` rounds the millihertz fields. `math.copysign` picks a direction when the error is zero and the rate is not. The frame is packed and unpacked before it enters the deque, so a width mismatch fails closed.
 
 ## ⚖️ Architecture Trade-offs & Pragmatic Decisions
 
-A state estimator would separate a real frequency excursion from a stuck transducer using PMU redundancy. This clamp has one series. The safe publication rule with one series is: move the published value only inside the RoCoF bound, and hold it when the step is physically implausible. Holding is a monitoring decision. It is not a command to a generator.
+The published value and the smoother are different series. In-band samples publish the measurement and move `f_hat`. Out-of-band samples still move `f_hat` by `alpha`, and the value that enters the deque is the clamped setpoint. An impossible step does neither to `f_hat`: following a 48 Hz/s spike would make every later sample look impossible.
 
-The nominal is 60 Hz because that is the interconnection this monitor is written for. A 50 Hz deployment would change the constant and the bound together. They are not inferred from the first sample, which is how a stuck 0 Hz transducer would otherwise redefine the nominal.
+The RoCoF limit on the published setpoint is a slew limit of `rocof_limit * dt` per sample. With the defaults, the deadband edge at 60.05 Hz is reachable in one step from 60.0 Hz. A setpoint that had already walked away from nominal would approach the new clamp over later samples.
+
+This package aligns with NERC CIP monitoring practice in the narrow sense that an out-of-band frequency is recorded, clamped, and counted inside the process. It does not claim a certification, and it does not describe a substation action.
 
 ## 🚀 Local Installation & Benchmarking
 
 ```bash
 python3 -m venv venv
 source venv/bin/activate
-pip install -r requirements.txt
-python src/main.py
-python src/test_harness.py
+pip install -e ".[dev]"
+python -m scada_grid_frequency_drift_clamp
+python -m scada_grid_frequency_drift_clamp.harness
 ```
 
 ```python
 import asyncio
 
-from src.main import FrequencyDriftClamp
+from scada_grid_frequency_drift_clamp import ScadaGridFrequencyDriftClamp
 
 
 async def demo() -> None:
-    clamp = FrequencyDriftClamp()
-    await clamp.ingest_sample(60.0)
-    series = await clamp.published_series()
-    return series
+    engine = ScadaGridFrequencyDriftClamp()
+    result = await engine.run([60.0, 60.01, 60.2])
+    print(result)
 
 
 asyncio.run(demo())
 ```
 
-The runtime is the Python 3.12 standard library. `pip install -r requirements.txt` succeeds with nothing to fetch.
+The runtime is the Python 3.12 standard library. `pip install -r requirements.txt` succeeds with comments only. Install the package with `pip install .`.
 
 ## 🖥️ Terminal Diagnostic Output Preview
 
 ```
-WARNING grid.frequency.clamp frequency 60.200 Hz published as setpoint 60.050 Hz rocof 1.995 Hz/s; no control write
-WARNING grid.frequency.clamp RoCoF 48.000 Hz/s exceeds physical bound 5.000; holding setpoint 60.050 Hz; transducer or clock skew; no control write
-WARNING grid.frequency.clamp non-finite frequency sample rejected
-INFO grid.frequency.clamp scenario complete series_len=21 fault=impossible_rocof control_write=False
+2026-10-02T02:54:19+0000 WARNING [grid.frequency.clamp] clamped 60.200000 Hz to 60.050000 Hz rocof 0.576643 Hz/s mean 60.002491 spread 0.010160 local setpoint only
+2026-10-02T02:54:19+0000 WARNING [grid.frequency.clamp] clamped 65.000000 Hz to 60.050000 Hz rocof 48.000000 Hz/s mean 60.003622 spread 0.012378 local setpoint only
+2026-10-02T02:54:19+0000 INFO [grid.frequency.clamp] scenario complete published_hz=60.050000 clamps=2 rejected=1 local-only
+{'published_hz': 60.05, 'rocof_hz_s': 47.99999999999997, 'clamps': 2, 'rejected': 1}
 ```
 
-`python src/main.py` exits 0. Stdout reports `control_write` false and `nan_rejected` true.
+`python -m scada_grid_frequency_drift_clamp` exits 0. The 65 Hz step is clamped to 60.05 Hz. The log records a local setpoint. No control write is emitted.
 
 ## 📊 Empirical Benchmarking Performance Report
 
-Measured by `python src/test_harness.py` with a deterministic seed, 5000 iterations, `time.perf_counter_ns` latency in microseconds, and `tracemalloc` peak.
+Measured by `python -m scada_grid_frequency_drift_clamp.harness` with seed `20261002`, 5000 iterations, `perf_counter_ns` latency in microseconds, and `tracemalloc` peak. Each iteration is one in-band sample. The per-sample mean and spread on the 64-wide window dominate the latency. The harness prints this status dict and exits 0 only when every edge passes:
+
+```
+{'status': 'ok', 'failures': 0, 'latency_us': 389.093, 'memory_peak_bytes': 554188, 'benchmark_iterations': 5000, 'benchmark_avg_us': 389.093, 'benchmark_p99_us': 521.961}
+```
 
 | Metric | Measured |
 | --- | ---: |
-| Status | PASS |
+| Status | ok |
+| Failures | 0 |
 | Iterations | 5000 |
-| Average latency | 375.71 µs |
-| Empirical P99 | 479.07 µs |
-| tracemalloc peak | 449254 bytes |
-| Edge: NaN sample | PASS |
-| Edge: impossible RoCoF | PASS |
+| Average latency | 389.093 µs |
+| Empirical P99 | 521.961 µs |
+| tracemalloc peak | 554188 bytes |
+| Edge: NaN sample | pass |
+| Edge: impossible RoCoF step | pass |
 
 ## 🛡️ Edge-Case Resilience & SOC2/Regulatory Compliance
 
-NaN and infinity are rejected with `EngineKernelException` and do not enter `published_series`. An impossible step is flagged, the setpoint is held, and `control_write` stays false. The log line states that no control write was emitted.
+A NaN sample raises `EngineKernelException` with a non-finite message. `clamps` and `rejected` stay at their previous values, and the next finite 60.0 Hz sample still publishes 60.0 Hz.
 
-The monitor is aligned with NERC CIP expectations for visibility into a measurement path: detect the bad sample, do not actuate, keep an ordered series. It is not a CIP evidence package and it does not authenticate to a control center. SOC 2 processing integrity is the publication rule itself: the series contains the clamped value, and the fault code names the sample that was withheld.
+An impossible step, a raw jump whose implied RoCoF exceeds 5 Hz/s, is clamped to 60.05 Hz when the previous setpoint is 60.0 Hz, counted in both `clamps` and `rejected`, and kept out of the smoother. The following 60.0 Hz sample does not increment `rejected`, which is the evidence the estimator did not follow the spike.
+
+The series never leaves this process. NERC CIP monitoring alignment is the audit frame, the clamp counter, and the refusal to publish the raw excursion. This package does not claim a certification and does not perform a grid control write.
