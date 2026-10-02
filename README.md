@@ -13,6 +13,14 @@
 | **Website** | https://github.com/TechieGoku2623/scada-grid-frequency-drift-clamp |
 | **Topics** | `python` `asyncio` `smart-grid` `scada` `frequency` `telemetry` |
 
+## The problem this solves
+
+Grid frequency telemetry is nominally 60 Hz. A single sample at 60.80 Hz can be a sensor fault. Publishing that sample raw makes downstream logic treat a glitch as a grid event, and it must never become a control command.
+
+SCADA Grid Frequency Drift Clamp smooths with an exponential filter, computes rate of change of frequency, and clamps the value it publishes. In the reference scenario, 60.80 Hz is published as 60.050 Hz with a RoCoF of 7.8 Hz/s, one clamp, and one rejection. A non-numeric sample raises. The engine publishes telemetry only. It emits no control write.
+
+That boundary, a bounded measurement with no actuation, is the NERC CIP-aligned split.
+
 ## Walkthrough
 
 ### How it works
