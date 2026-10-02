@@ -2,6 +2,11 @@
 
 A high-throughput, low-latency asynchronous engine engineered to resolve out-of-band grid frequency samples by smoothing a nominal 60 Hz series in process and publishing a deadband- and RoCoF-limited setpoint.
 
+Website: https://github.com/TechieGoku2623/scada-grid-frequency-drift-clamp
+
+Topics: `python` `asyncio` `smart-grid` `scada` `frequency` `telemetry`
+
+
 ## 🏗️ Systems Architecture & Event Topology
 
 `ScadaGridFrequencyDriftClamp` ingests a frequency series under an `asyncio.Lock`. Nominal frequency is 60.0 Hz and the sample period is 0.1 s (100 ms). `run(records)` returns a JSON-serializable dict: `published_hz`, `rocof_hz_s`, `clamps`, and `rejected`.
@@ -20,6 +25,8 @@ An implied raw RoCoF above the hard ceiling (5.0 Hz/s) is clamped and counted. T
 The measurement record is `struct` format `<HHHiii`: sync `0x4652`, flags, cadence in milliseconds, measured millihertz, RoCoF in millihertz per second, and published millihertz. A length prefix seals the frame. The engine never emits a control write and never opens a field protocol.
 
 ## 📊 Core Visual Walkthrough & Engine Pipeline Flow
+
+![Terminal walkthrough](docs/assets/terminal-walkthrough.gif)
 
 ```
 frequency sample (Hz), dt = 0.1 s

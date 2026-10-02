@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "scada-grid-frequency-drift-clamp"
 version = "1.0.0"
-description = "SCADA Grid Frequency Drift Clamp"
+description = "In-process 60 Hz frequency smoother that clamps rate of change without writing a field control."
 readme = "README.md"
 license = {text = "MIT"}
 authors = [{name = "TechieGoku2623"}]
