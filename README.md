@@ -1,94 +1,64 @@
 # SCADA Grid Frequency Drift Clamp
 
-A high-throughput, low-latency asynchronous engine engineered to resolve out-of-band grid frequency samples by smoothing a nominal 60 Hz series in process and publishing a deadband- and RoCoF-limited setpoint.
+> Smooths a 60 Hz series, computes rate of change, and publishes a clamped value when frequency or RoCoF leaves its band. It never writes a control.
 
-Website: https://github.com/TechieGoku2623/scada-grid-frequency-drift-clamp
+<p>
+  <a href="https://github.com/TechieGoku2623/scada-grid-frequency-drift-clamp/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/TechieGoku2623/scada-grid-frequency-drift-clamp/actions/workflows/ci.yml/badge.svg"></a>
+  <img alt="Python 3.12" src="https://img.shields.io/badge/python-3.12-3776AB?logo=python&logoColor=white">
+  <img alt="MIT license" src="https://img.shields.io/badge/license-MIT-2ea043">
+</p>
 
-Topics: `python` `asyncio` `smart-grid` `scada` `frequency` `telemetry`
+| | |
+| --- | --- |
+| **Website** | https://github.com/TechieGoku2623/scada-grid-frequency-drift-clamp |
+| **Topics** | `python` `asyncio` `smart-grid` `scada` `frequency` `telemetry` |
 
+## Walkthrough
 
-## 🏗️ Systems Architecture & Event Topology
+Three recordings from this repository. Each one is the command in the frame, not a drawing.
 
-`ScadaGridFrequencyDriftClamp` ingests a frequency series under an `asyncio.Lock`. Nominal frequency is 60.0 Hz and the sample period is 0.1 s (100 ms). `run(records)` returns a JSON-serializable dict: `published_hz`, `rocof_hz_s`, `clamps`, and `rejected`.
+### Engine
 
-The smoother is exponential:
-
-```
-f_hat = f_hat + alpha * (f - f_hat)
-RoCoF = (f_hat - previous_f_hat) / dt
-```
-
-`alpha` defaults to 0.30. If `abs(f - 60)` exceeds the deadband (0.05 Hz) or `abs(RoCoF)` exceeds 1.0 Hz/s, the engine publishes the clamped setpoint: nominal plus the deadband in the direction of the error, then limited so the published value cannot move faster than `rocof_limit * dt` from the previous published value. A warning is logged. The published series is a bounded `deque` (default 4096) standing in for TimescaleDB.
-
-An implied raw RoCoF above the hard ceiling (5.0 Hz/s) is clamped and counted. The smoother does not follow that sample. NaN and any non-finite sample raise `EngineKernelException` before the series changes.
-
-The measurement record is `struct` format `<HHHiii`: sync `0x4652`, flags, cadence in milliseconds, measured millihertz, RoCoF in millihertz per second, and published millihertz. A length prefix seals the frame. The engine never emits a control write and never opens a field protocol.
-
-## 📊 Core Visual Walkthrough & Engine Pipeline Flow
-
-Engine run.
+`python3 -m scada_grid_frequency_drift_clamp`
 
 ![Engine run](docs/assets/terminal-walkthrough.gif)
 
-Benchmark harness.
+NaN raises. A step that implies an impossible RoCoF is clamped and counted, not followed.
+
+### Benchmark
+
+`python3 -m scada_grid_frequency_drift_clamp.harness`
 
 ![Benchmark harness](docs/assets/benchmark-walkthrough.gif)
 
-Unit tests.
+5000 in-band samples, seed 20261002. The frame ends on the status line and `echo $?`.
+
+### Tests
+
+`python3 -m unittest discover -s tests -v`
 
 ![Unit tests](docs/assets/tests-walkthrough.gif)
 
+Wire round-trip, the happy path, and both edge cases below.
+
+## Pipeline
+
 ```
-frequency sample (Hz), dt = 0.1 s
-        |
-        v
-finite gate ---- NaN or inf --> EngineKernelException
-        |
-        v
-implied RoCoF versus last admitted sample
-        |
-        +--> abs(implied) > 5 Hz/s
-        |       clamp, count clamps and rejected
-        |       do not update f_hat
-        |
-        v
-f_hat = f_hat + alpha * (f - f_hat)
-RoCoF = (f_hat - previous) / dt
-        |
-        +--> outside deadband or |RoCoF| > 1 Hz/s
-        |       publish nominal ± deadband
-        |       limit the step to rocof_limit * dt
-        |
-        +--> inside the band --> publish f
-        |
-        v
-bounded deque (TimescaleDB stand-in) + measurement frame
-        |
-        v
+Hz sample
+  |
+  v
+f_hat += alpha * (f - f_hat)
+  |
+  v
+RoCoF = (f_hat - previous) / 0.1 s
+  |
+  +--> inside deadband --> publish f_hat
+  +--> outside ----------> publish clamp, WARNING
+  v
 {published_hz, rocof_hz_s, clamps, rejected}
 ```
 
-Insert the structural terminal walkthrough recording at docs/assets/terminal-walkthrough.gif before publishing the release notes.
-
-## ⚡ Low-Level OS Mechanics & Network Physics
-
-The sample period is the model `dt`, not a sleep. A batch of samples is scored as if they arrived 100 ms apart, which keeps the benchmark on the arithmetic path.
-
-The deadband edges sit at 59.95 Hz and 60.05 Hz. A sample of 60.2 Hz is admitted to the smoother, because the implied step from a nearby in-band sample is under the 5 Hz/s ceiling, and the published setpoint is pulled back to 60.05 Hz when the previous setpoint is within one RoCoF step (`1.0 Hz/s * 0.1 s = 0.1 Hz`).
-
-A step such as 60.2 Hz then 65.0 Hz implies about 48 Hz/s. That is above the hard ceiling. The engine publishes 60.05 Hz, increments `clamps` and `rejected`, stores the implied rate in `rocof_hz_s`, and leaves `f_hat` and the last admitted sample unchanged. The next in-band 60.0 Hz sample is therefore still admissible.
-
-`statistics.fmean` and `statistics.pstdev` run on a 64-sample window so the warning carries the recent mean and spread. `math.floor` rounds the millihertz fields. `math.copysign` picks a direction when the error is zero and the rate is not. The frame is packed and unpacked before it enters the deque, so a width mismatch fails closed.
-
-## ⚖️ Architecture Trade-offs & Pragmatic Decisions
-
-The published value and the smoother are different series. In-band samples publish the measurement and move `f_hat`. Out-of-band samples still move `f_hat` by `alpha`, and the value that enters the deque is the clamped setpoint. An impossible step does neither to `f_hat`: following a 48 Hz/s spike would make every later sample look impossible.
-
-The RoCoF limit on the published setpoint is a slew limit of `rocof_limit * dt` per sample. With the defaults, the deadband edge at 60.05 Hz is reachable in one step from 60.0 Hz. A setpoint that had already walked away from nominal would approach the new clamp over later samples.
-
-This package aligns with NERC CIP monitoring practice in the narrow sense that an out-of-band frequency is recorded, clamped, and counted inside the process. It does not claim a certification, and it does not describe a substation action.
-
-## 🚀 Local Installation & Benchmarking
+## Quick start
 
 ```bash
 python3 -m venv venv
@@ -96,7 +66,12 @@ source venv/bin/activate
 pip install -e ".[dev]"
 python -m scada_grid_frequency_drift_clamp
 python -m scada_grid_frequency_drift_clamp.harness
+python -m unittest discover -s tests -v
 ```
+
+Python 3.12. The runtime is the standard library. `black` and `flake8` are the `dev` extra.
+
+## Use it
 
 ```python
 import asyncio
@@ -113,42 +88,32 @@ async def demo() -> None:
 asyncio.run(demo())
 ```
 
-The runtime is the Python 3.12 standard library. `pip install -r requirements.txt` succeeds with comments only. Install the package with `pip install .`.
+## Bounds
 
-## 🖥️ Terminal Diagnostic Output Preview
-
-```
-2026-10-02T02:54:19+0000 WARNING [grid.frequency.clamp] clamped 60.200000 Hz to 60.050000 Hz rocof 0.576643 Hz/s mean 60.002491 spread 0.010160 local setpoint only
-2026-10-02T02:54:19+0000 WARNING [grid.frequency.clamp] clamped 65.000000 Hz to 60.050000 Hz rocof 48.000000 Hz/s mean 60.003622 spread 0.012378 local setpoint only
-2026-10-02T02:54:19+0000 INFO [grid.frequency.clamp] scenario complete published_hz=60.050000 clamps=2 rejected=1 local-only
-{'published_hz': 60.05, 'rocof_hz_s': 47.99999999999997, 'clamps': 2, 'rejected': 1}
-```
-
-`python -m scada_grid_frequency_drift_clamp` exits 0. The 65 Hz step is clamped to 60.05 Hz. The log records a local setpoint. No control write is emitted.
-
-## 📊 Empirical Benchmarking Performance Report
-
-Measured by `python -m scada_grid_frequency_drift_clamp.harness` with seed `20261002`, 5000 iterations, `perf_counter_ns` latency in microseconds, and `tracemalloc` peak. Each iteration is one in-band sample. The per-sample mean and spread on the 64-wide window dominate the latency. The harness prints this status dict and exits 0 only when every edge passes:
-
-```
-{'status': 'ok', 'failures': 0, 'latency_us': 389.093, 'memory_peak_bytes': 554188, 'benchmark_iterations': 5000, 'benchmark_avg_us': 389.093, 'benchmark_p99_us': 521.961}
-```
-
-| Metric | Measured |
+| | |
 | --- | ---: |
-| Status | ok |
-| Failures | 0 |
 | Iterations | 5000 |
-| Average latency | 389.093 µs |
-| Empirical P99 | 521.961 µs |
+| Average | 389.093 µs |
+| P99 | 521.961 µs |
 | tracemalloc peak | 554188 bytes |
-| Edge: NaN sample | pass |
-| Edge: impossible RoCoF step | pass |
 
-## 🛡️ Edge-Case Resilience & SOC2/Regulatory Compliance
+Figures are from the harness on the machine that published them. A later host moves the microseconds. The pass/fail result does not.
 
-A NaN sample raises `EngineKernelException` with a non-finite message. `clamps` and `rejected` stay at their previous values, and the next finite 60.0 Hz sample still publishes 60.0 Hz.
+## What it refuses
 
-An impossible step, a raw jump whose implied RoCoF exceeds 5 Hz/s, is clamped to 60.05 Hz when the previous setpoint is 60.0 Hz, counted in both `clamps` and `rejected`, and kept out of the smoother. The following 60.0 Hz sample does not increment `rejected`, which is the evidence the estimator did not follow the spike.
+- A NaN sample raises `EngineKernelException` and is not published.
+- A step past the hard RoCoF ceiling is clamped to the band and counted. The raw step is not emitted.
 
-The series never leaves this process. NERC CIP monitoring alignment is the audit frame, the clamp counter, and the refusal to publish the raw excursion. This package does not claim a certification and does not perform a grid control write.
+Aligned with NERC CIP monitoring of BES telemetry integrity. This process does not speak a field protocol.
+
+## Tree
+
+```
+src/scada_grid_frequency_drift_clamp/
+  engine.py       kernel
+  wire.py         struct frames
+  harness.py      benchmark
+  __main__.py     demo entry
+tests/test_engine.py
+Dockerfile        non-root, uid 10001
+```
