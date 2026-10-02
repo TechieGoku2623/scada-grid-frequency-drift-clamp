@@ -13,6 +13,14 @@
 | **Website** | https://github.com/TechieGoku2623/scada-grid-frequency-drift-clamp |
 | **Topics** | `python` `asyncio` `smart-grid` `scada` `frequency` `telemetry` |
 
+## Watch the demo
+
+<p align="center">
+  <img src="docs/demo.gif" alt="SCADA Grid Frequency Drift Clamp dashboard walkthrough" width="920"/>
+</p>
+
+Play the video: [docs/watch.html](docs/watch.html)
+
 ## The problem this solves
 
 Grid frequency telemetry is nominally 60 Hz. A single sample at 60.80 Hz can be a sensor fault. Publishing that sample raw makes downstream logic treat a glitch as a grid event, and it must never become a control command.
